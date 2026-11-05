@@ -1,0 +1,90 @@
+{
+  "course_id": 48957,
+  "cmid": 1234567,
+  "sheet_number": 1,
+  "students": {
+    "JDoe_sheet1.pdf": {
+      "userid": "100003",
+      "fullname": "John Doe",
+      "firstname": "John",
+      "surname": "Doe",
+      "filename": "JDoe_sheet1.pdf",
+      "sheet_number": 1,
+      "participant_id": "900003",
+      "moodle_folder": "John Doe_900003_assignsubmission_file_",
+      "original_filenames": [
+        "analysis_blatt1.pdf"
+      ],
+      "current_grade": "",
+      "partner_userid": "100004",
+      "partner_fullname": "Jane Roe",
+      "partner_match_source": "roster_min_distance",
+      "partner_candidates": [],
+      "detected_matriculations": [
+        "11223344"
+      ],
+      "header_excerpt": ""
+    },
+    "MMustermann_sheet1.pdf": {
+      "userid": "100001",
+      "fullname": "Max Mustermann",
+      "firstname": "Max",
+      "surname": "Mustermann",
+      "filename": "MMustermann_sheet1.pdf",
+      "sheet_number": 1,
+      "participant_id": "900001",
+      "moodle_folder": "Max Mustermann_900001_assignsubmission_file_",
+      "original_filenames": [
+        "blatt1.pdf"
+      ],
+      "current_grade": "17.5",
+      "partner_userid": "100002",
+      "partner_fullname": "Erika Musterfrau",
+      "partner_match_source": "confirmed",
+      "partner_candidates": [],
+      "detected_matriculations": [
+        "12345678",
+        "87654321"
+      ],
+      "header_excerpt": ""
+    }
+  },
+  "course_roster": [
+    {
+      "userid": "100001",
+      "fullname": "Max Mustermann",
+      "firstname": "Max",
+      "surname": "Mustermann",
+      "participant_id": "900001",
+      "moodle_folder": null,
+      "matriculation_number": null
+    },
+    {
+      "userid": "100002",
+      "fullname": "Erika Musterfrau",
+      "firstname": "Erika",
+      "surname": "Musterfrau",
+      "participant_id": "900002",
+      "moodle_folder": null,
+      "matriculation_number": null
+    },
+    {
+      "userid": "100003",
+      "fullname": "John Doe",
+      "firstname": "John",
+      "surname": "Doe",
+      "participant_id": "900003",
+      "moodle_folder": null,
+      "matriculation_number": null
+    },
+    {
+      "userid": "100004",
+      "fullname": "Jane Roe",
+      "firstname": "Jane",
+      "surname": "Roe",
+      "participant_id": "900004",
+      "moodle_folder": null,
+      "matriculation_number": null
+    }
+  ]
+}

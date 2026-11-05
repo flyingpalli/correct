@@ -1,0 +1,13 @@
+{
+  "workdir": "./sheets",
+  "course_id": 48957,
+  "username": "ab12cdef@campus.lmu.de",
+  "marker": "",
+  "last_sheet": 1,
+  "show_pdf_preview": true,
+  "known_partners": {
+    "100001": "100002",
+    "100002": "100001"
+  },
+  "known_matriculations": {}
+}
