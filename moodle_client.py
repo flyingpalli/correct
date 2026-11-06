@@ -111,6 +111,73 @@ def names_match(candidate: str, target: str) -> bool:
     return bool(c_tokens and t_tokens and (c_tokens == t_tokens or t_tokens.issubset(c_tokens)))
 
 
+TRAINER_ROLE_PATTERN = re.compile(
+    r"\b(trainer|teacher|dozent|lehrende|kursverwalter|manager)\b",
+    re.IGNORECASE,
+)
+
+
+def extract_trainers_from_participants_html(html: str) -> List[str]:
+    """Extract full names of users with teacher/trainer/assistant roles from Moodle participants HTML."""
+    from pdf_processor import strip_moodle_userinitials
+
+    soup = BeautifulSoup(html, "html.parser")
+    trainer_names: List[str] = []
+    seen = set()
+
+    for tr in soup.find_all("tr"):
+        a_tag = tr.find("a", href=re.compile(r"/user/(?:view|profile)\.php\?id=\d+"))
+        if not a_tag:
+            continue
+        fullname = LMUMoodleClient._extract_clean_user_link_name(a_tag)
+        if not fullname or len(fullname) < 3 or fullname.isdigit():
+            continue
+
+        is_trainer = False
+        role_cells = tr.find_all(
+            lambda tag: (
+                tag.name in ("td", "th", "div", "span")
+                and (
+                    "roles" in tag.get("class", [])
+                    or tag.get("data-field") == "roles"
+                    or "col_roles" in tag.get("class", [])
+                )
+            )
+        )
+        for cell in role_cells:
+            if TRAINER_ROLE_PATTERN.search(cell.get_text()):
+                is_trainer = True
+                break
+
+        if not is_trainer and not role_cells:
+            for td in tr.find_all("td"):
+                if td.find("a", href=re.compile(r"/user/(?:view|profile)\.php\?id=\d+")):
+                    continue
+                if TRAINER_ROLE_PATTERN.search(td.get_text()):
+                    is_trainer = True
+                    break
+
+        if is_trainer:
+            clean = strip_moodle_userinitials(fullname).strip()
+            norm = clean.lower()
+            if norm and norm not in seen:
+                seen.add(norm)
+                trainer_names.append(clean)
+
+    for contact in soup.select(".course-contact, .course-contacts, .teachers, .course-info-teachers"):
+        text = contact.get_text()
+        if TRAINER_ROLE_PATTERN.search(text):
+            for a_tag in contact.find_all("a", href=re.compile(r"/user/(?:view|profile)\.php\?id=\d+")):
+                name = LMUMoodleClient._extract_clean_user_link_name(a_tag)
+                clean = strip_moodle_userinitials(name).strip() if name else ""
+                norm = clean.lower()
+                if clean and norm not in seen:
+                    seen.add(norm)
+                    trainer_names.append(clean)
+
+    return trainer_names
+
+
 class LMUMoodleClient:
     """Client for interacting with moodle.lmu.de via LMU Shibboleth SSO."""
 
@@ -1182,9 +1249,49 @@ class LMUMoodleClient:
                 mapping[row.fullname.lower()] = row.participant_id
         return mapping
 
+    def fetch_course_trainers(self, course_id: int) -> List[str]:
+        """Fetch and return trainer/lecturer names for a course from Moodle."""
+        from pdf_processor import (
+            get_excluded_partner_names,
+            register_excluded_partner_names,
+            save_user_settings,
+        )
+
+        participants_url = f"{self.base_url}/user/index.php?id={course_id}&perpage=5000"
+        assert_https_and_host(participants_url, {"moodle.lmu.de"})
+        trainers: List[str] = []
+        try:
+            resp = self.session.get(participants_url, verify=self.verify_tls, timeout=25)
+            if resp.ok:
+                trainers.extend(extract_trainers_from_participants_html(resp.text))
+        except Exception:
+            pass
+
+        course_url = f"{self.base_url}/course/view.php?id={course_id}"
+        try:
+            resp_c = self.session.get(course_url, verify=self.verify_tls, timeout=15)
+            if resp_c.ok:
+                trainers.extend(extract_trainers_from_participants_html(resp_c.text))
+        except Exception:
+            pass
+
+        trainers = list(dict.fromkeys(trainers))
+        if trainers:
+            register_excluded_partner_names(trainers)
+            try:
+                save_user_settings({"excluded_trainers": sorted(get_excluded_partner_names())})
+            except Exception:
+                pass
+        return trainers
+
     def fetch_course_participants_rows(self, course_id: int) -> List[RawSubmissionRow]:
         """Fetch enrolled course participants from /user/index.php?id=<course_id> if accessible."""
-        from pdf_processor import is_excluded_partner_name
+        from pdf_processor import (
+            get_excluded_partner_names,
+            is_excluded_partner_name,
+            register_excluded_partner_names,
+            save_user_settings,
+        )
 
         participants_url = f"{self.base_url}/user/index.php?id={course_id}&perpage=5000"
         assert_https_and_host(participants_url, {"moodle.lmu.de"})
@@ -1192,6 +1299,15 @@ class LMUMoodleClient:
             resp = self.session.get(participants_url, verify=self.verify_tls, timeout=25)
             if not resp.ok:
                 return []
+
+            detected_trainers = extract_trainers_from_participants_html(resp.text)
+            if detected_trainers:
+                register_excluded_partner_names(detected_trainers)
+                try:
+                    save_user_settings({"excluded_trainers": sorted(get_excluded_partner_names())})
+                except Exception:
+                    pass
+
             soup = BeautifulSoup(resp.text, "html.parser")
             rows_out: List[RawSubmissionRow] = []
             seen_uids = set()
@@ -1212,9 +1328,37 @@ class LMUMoodleClient:
                     or is_excluded_partner_name(fullname)
                 ):
                     continue
+
+                tr = a_tag.find_parent("tr")
+                if tr:
+                    is_tr_trainer = False
+                    role_cells = tr.find_all(
+                        lambda tag: (
+                            tag.name in ("td", "th", "div", "span")
+                            and (
+                                "roles" in tag.get("class", [])
+                                or tag.get("data-field") == "roles"
+                                or "col_roles" in tag.get("class", [])
+                            )
+                        )
+                    )
+                    for cell in role_cells:
+                        if TRAINER_ROLE_PATTERN.search(cell.get_text()):
+                            is_tr_trainer = True
+                            break
+                    if not is_tr_trainer and not role_cells:
+                        for td in tr.find_all("td"):
+                            if td.find("a", href=re.compile(r"/user/(?:view|profile)\.php\?id=\d+")):
+                                continue
+                            if TRAINER_ROLE_PATTERN.search(td.get_text()):
+                                is_tr_trainer = True
+                                break
+                    if is_tr_trainer:
+                        register_excluded_partner_names([fullname])
+                        continue
+
                 seen_uids.add(uid)
                 matr_num = None
-                tr = a_tag.find_parent("tr")
                 if tr:
                     tr_text = tr.get_text(" ", strip=True)
                     for m8 in re.finditer(r"\b(\d{8})\b", tr_text):

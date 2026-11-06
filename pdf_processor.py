@@ -16,7 +16,7 @@ import unicodedata
 import zipfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 
 SETTINGS_FILE = Path(__file__).resolve().parent / "settings.json"
@@ -29,6 +29,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "show_pdf_preview": True,
     "known_partners": {},
     "known_matriculations": {},
+    "excluded_trainers": [],
 }
 
 
@@ -120,24 +121,34 @@ HEADER_BOILERPLATE_WORDS = {
     "uebungsleitung",
     "ubungsleitung",
     "vorlesung",
-    "makai",
-    "ferrero",
 }
 
-EXCLUDED_PARTNER_NAMES: Tuple[str, ...] = (
-    "Peter Müller",
-    "Peter Mueller",
-    "Tamas Makai",
-    "Tamás Makai",
-    "Margherita Ferrero",
-)
+_MASK_WORDS = HEADER_BOILERPLATE_WORDS
 
-EXCLUDED_PARTNER_TOKEN_PAIRS: Tuple[Tuple[str, str], ...] = (
-    ("peter", "mueller"),
-    ("peter", "muller"),
-    ("tamas", "makai"),
-    ("margherita", "ferrero"),
-)
+_EXCLUDED_TRAINER_NAMES: Set[str] = set()
+
+
+def register_excluded_partner_names(names: Sequence[str]) -> None:
+    """Register course lecturers, assistants, or trainers to exclude from partner matching."""
+    for name in names:
+        if name and isinstance(name, str):
+            clean = strip_moodle_userinitials(name).strip()
+            if clean:
+                _EXCLUDED_TRAINER_NAMES.add(clean)
+
+
+def get_excluded_partner_names() -> Set[str]:
+    """Return the current set of excluded trainer / lecturer / assistant names."""
+    return set(_EXCLUDED_TRAINER_NAMES)
+
+
+def clear_excluded_partner_names() -> None:
+    """Clear the registered excluded trainer names."""
+    _EXCLUDED_TRAINER_NAMES.clear()
+
+
+EXCLUDED_PARTNER_NAMES: Tuple[str, ...] = ()
+EXCLUDED_PARTNER_TOKEN_PAIRS: Tuple[Tuple[str, str], ...] = ()
 
 
 @dataclass
@@ -318,6 +329,7 @@ def save_manifest(
         "cmid": cmid,
         "sheet_number": sheet_number,
         "students": {rec.filename: asdict(rec) for rec in sorted_records},
+        "excluded_trainers": sorted(get_excluded_partner_names()),
     }
     if course_roster is not None:
         filtered_roster = [
@@ -349,6 +361,9 @@ def load_manifest_with_roster(
     course_id = int(raw["course_id"])
     cmid = int(raw["cmid"])
     sheet_number = int(raw["sheet_number"])
+
+    if "excluded_trainers" in raw and isinstance(raw["excluded_trainers"], list):
+        register_excluded_partner_names(raw["excluded_trainers"])
 
     unsorted_students: List[Tuple[str, StudentSubmissionRecord]] = []
     valid_rec_keys = set(StudentSubmissionRecord.__dataclass_fields__.keys())
@@ -744,12 +759,28 @@ def is_excluded_partner_name(fullname: str) -> bool:
     if not norm:
         return False
     tokens = set(norm.split())
-    for first_tok, last_tok in EXCLUDED_PARTNER_TOKEN_PAIRS:
-        if first_tok in tokens and last_tok in tokens:
+    cand_name_tokens = [tok for tok in norm.split() if tok not in _MASK_WORDS and len(tok) >= 2]
+    cand_core = " ".join(cand_name_tokens)
+
+    for trainer_name in get_excluded_partner_names():
+        t_norm = _normalize_match_str(trainer_name)
+        if not t_norm:
+            continue
+        if _norm_edit_similarity(norm, t_norm) >= 0.85:
             return True
-        full_excl = f"{first_tok} {last_tok}"
-        if _norm_edit_similarity(norm, full_excl) >= 0.86:
+        t_name_tokens = [tok for tok in t_norm.split() if tok not in _MASK_WORDS and len(tok) >= 2]
+        t_core = " ".join(t_name_tokens)
+        if cand_core and t_core and _norm_edit_similarity(cand_core, t_core) >= 0.85:
             return True
+        if len(t_name_tokens) >= 2:
+            if all(
+                any(_norm_edit_similarity(t_tok, c_tok) >= 0.85 for c_tok in tokens)
+                for t_tok in t_name_tokens
+            ):
+                return True
+        elif len(t_name_tokens) == 1:
+            if t_name_tokens[0] in cand_name_tokens and len(cand_name_tokens) == 1:
+                return True
     return False
 
 
@@ -841,9 +872,15 @@ def _is_typed_assignment_text(top_txt: str, body_txt: str) -> bool:
     if not combined_norm:
         return False
     tokens = set(combined_norm.split())
-    for first_tok, last_tok in EXCLUDED_PARTNER_TOKEN_PAIRS:
-        if first_tok in tokens and last_tok in tokens:
-            return True
+    for trainer_name in get_excluded_partner_names():
+        t_norm = _normalize_match_str(trainer_name)
+        t_name_tokens = [tok for tok in t_norm.split() if tok not in _MASK_WORDS and len(tok) >= 2]
+        if len(t_name_tokens) >= 2:
+            if all(
+                any(_norm_edit_similarity(t_tok, c_tok) >= 0.85 for c_tok in tokens)
+                for t_tok in t_name_tokens
+            ):
+                return True
     return False
 
 
@@ -1051,19 +1088,26 @@ def _mask_submitter_and_boilerplate(
         f"{sub_last_norm} {sub_primary_first}".strip(),
         f"{sub_initial} {sub_last_norm}".strip(),
         f"{sub_initial}{sub_last_norm}".strip(),
-        "peter mueller",
-        "mueller peter",
-        "peter muller",
-        "muller peter",
-        "p mueller",
-        "p muller",
-        "tamas makai",
-        "makai tamas",
-        "t makai",
-        "margherita ferrero",
-        "ferrero margherita",
-        "m ferrero",
     ]
+    for trainer_name in get_excluded_partner_names():
+        t_norm = _normalize_match_str(trainer_name)
+        if not t_norm:
+            continue
+        phrases_to_strip.append(t_norm)
+        t_name_tokens = [tok for tok in t_norm.split() if tok not in _MASK_WORDS and len(tok) >= 2]
+        if len(t_name_tokens) >= 2:
+            first = t_name_tokens[0]
+            last = t_name_tokens[-1]
+            first_init = first[0] if first else ""
+            phrases_to_strip.extend(
+                [
+                    f"{first} {last}",
+                    f"{last} {first}",
+                ]
+            )
+            if first_init and last:
+                phrases_to_strip.append(f"{first_init} {last}")
+                phrases_to_strip.append(f"{first_init}{last}")
     if marker_name:
         m_first, m_last = split_fullname(marker_name)
         mf_norm = _normalize_match_str(m_first)
@@ -1622,6 +1666,8 @@ def load_user_settings(settings_path: Path = SETTINGS_FILE) -> Dict[str, Any]:
                 merged.update(loaded)
         except Exception:
             pass
+    if "excluded_trainers" in merged and isinstance(merged["excluded_trainers"], list):
+        register_excluded_partner_names(merged["excluded_trainers"])
     return merged
 
 

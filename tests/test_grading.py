@@ -18,6 +18,7 @@ from moodle_client import (
     RawSubmissionRow,
     SecurityError,
     assert_https_and_host,
+    extract_trainers_from_participants_html,
     names_match,
 )
 from pdf_processor import (
@@ -25,6 +26,7 @@ from pdf_processor import (
     MarkedSubmissionItem,
     StudentSubmissionRecord,
     build_moodle_feedback_zip,
+    clear_excluded_partner_names,
     detect_partner_for_record,
     expand_marked_items_with_partners,
     extract_score_from_filename,
@@ -39,6 +41,7 @@ from pdf_processor import (
     match_partner_in_course_roster,
     merge_pdf_bytes_list,
     read_grades_csv,
+    register_excluded_partner_names,
     resolve_partner_by_query,
     save_manifest,
     split_fullname,
@@ -481,18 +484,23 @@ class TestPDFNamingAndPackaging(unittest.TestCase):
             self.assertTrue(len(rec.partner_candidates) >= 2)
 
     def test_excluded_professor_assistant_names_and_totally_typed_page_skipping(self) -> None:
-        self.assertTrue(is_excluded_partner_name("Peter Müller"))
-        self.assertTrue(is_excluded_partner_name("Prof. Dr. Peter Mueller"))
-        self.assertTrue(is_excluded_partner_name("Tamas Makai"))
-        self.assertTrue(is_excluded_partner_name("Tamás Makai"))
-        self.assertTrue(is_excluded_partner_name("Margherita Ferrero"))
-        self.assertFalse(is_excluded_partner_name("Anna-Lena Müller"))
+        clear_excluded_partner_names()
+        register_excluded_partner_names(
+            ["Prof. Dr. Mock Lecturer", "Assistant Alpha", "Assistant Beta"]
+        )
+
+        self.assertTrue(is_excluded_partner_name("Prof. Dr. Mock Lecturer"))
+        self.assertTrue(is_excluded_partner_name("Mock Lecturer"))
+        self.assertTrue(is_excluded_partner_name("Lecturer Mock"))
+        self.assertTrue(is_excluded_partner_name("Assistant Alpha"))
+        self.assertTrue(is_excluded_partner_name("Assistant Beta"))
+        self.assertFalse(is_excluded_partner_name("Anna-Lena Student"))
         self.assertFalse(is_excluded_partner_name("Erika Musterfrau"))
 
         roster = [
-            CourseStudent(userid="1", fullname="Peter Müller"),
-            CourseStudent(userid="2", fullname="Tamas Makai"),
-            CourseStudent(userid="3", fullname="Margherita Ferrero"),
+            CourseStudent(userid="1", fullname="Prof. Dr. Mock Lecturer"),
+            CourseStudent(userid="2", fullname="Assistant Alpha"),
+            CourseStudent(userid="3", fullname="Assistant Beta"),
             CourseStudent(userid="101", fullname="Max Mustermann"),
             CourseStudent(userid="102", fullname="Erika Musterfrau"),
             CourseStudent(userid="103", fullname="John Doe"),
@@ -501,7 +509,7 @@ class TestPDFNamingAndPackaging(unittest.TestCase):
         # 1. Verify a totally typed single-page assignment sheet is excluded from partner search
         typed_page_bytes = make_blank_pdf_bytes(
             1,
-            text="Analysis 1 - Prof. Dr. Peter Müller, Tamas Makai, Margherita Ferrero - Aufgabe 1: John Doe",
+            text="Analysis 1 - Prof. Dr. Mock Lecturer, Assistant Alpha, Assistant Beta - Aufgabe 1: John Doe",
             totally_typed=True,
         )
         reader_typed = PdfReader(io.BytesIO(typed_page_bytes))
@@ -515,12 +523,12 @@ class TestPDFNamingAndPackaging(unittest.TestCase):
             self.assertEqual(method_t, "typed_excluded")
 
             # 2. Verify a 2-page PDF where Page 1 is the totally typed assignment sheet (mentioning
-            # Peter Müller, Tamas Makai, Margherita Ferrero, and John Doe) and Page 2 is the student's
+            # Prof. Dr. Mock Lecturer, Assistant Alpha, Assistant Beta, and John Doe) and Page 2 is the student's
             # handwritten page ("Max Mustermann 12345678, Erika Musterfrau 87654321") skips Page 1
             # and matches Erika Musterfrau (102) from Page 2
             handwritten_page2_bytes = make_blank_pdf_bytes(
                 1,
-                text="Peter Müller Tamas Makai Margherita Ferrero Max Mustermann 12345678 Erika Musterfrau 87654321",
+                text="Prof. Dr. Mock Lecturer Assistant Alpha Assistant Beta Max Mustermann 12345678 Erika Musterfrau 87654321",
                 totally_typed=False,
             )
             combined_bytes = merge_pdf_bytes_list(
@@ -543,9 +551,46 @@ class TestPDFNamingAndPackaging(unittest.TestCase):
             self.assertEqual(partner.userid, "102")
             self.assertEqual(rec.partner_fullname, "Erika Musterfrau")
             for cand_str in rec.partner_candidates:
-                self.assertNotIn("Peter Müller", cand_str)
-                self.assertNotIn("Tamas Makai", cand_str)
-                self.assertNotIn("Margherita Ferrero", cand_str)
+                self.assertNotIn("Mock Lecturer", cand_str)
+                self.assertNotIn("Assistant Alpha", cand_str)
+                self.assertNotIn("Assistant Beta", cand_str)
+
+    def test_moodle_trainer_role_recognition_from_participants(self) -> None:
+        """Verify automatic recognition and exclusion of participants with trainer roles."""
+        html = """
+        <table class="generaltable" id="participants">
+            <tbody>
+                <tr>
+                    <td><a href="https://moodle.lmu.de/user/view.php?id=10">Prof. Dr. Test Lecturer</a></td>
+                    <td class="roles">Trainer/in</td>
+                </tr>
+                <tr>
+                    <td><a href="https://moodle.lmu.de/user/view.php?id=11">Assistant First</a></td>
+                    <td data-field="roles">Trainer/in ohne Bearbeitungsrecht</td>
+                </tr>
+                <tr>
+                    <td><a href="https://moodle.lmu.de/user/view.php?id=12">Assistant Second</a></td>
+                    <td class="cell c4 roles">Non-editing teacher</td>
+                </tr>
+                <tr>
+                    <td><a href="https://moodle.lmu.de/user/view.php?id=101">Student Max</a></td>
+                    <td class="roles">Student/in</td>
+                </tr>
+            </tbody>
+        </table>
+        """
+        trainers = extract_trainers_from_participants_html(html)
+        self.assertIn("Prof. Dr. Test Lecturer", trainers)
+        self.assertIn("Assistant First", trainers)
+        self.assertIn("Assistant Second", trainers)
+        self.assertNotIn("Student Max", trainers)
+
+        clear_excluded_partner_names()
+        register_excluded_partner_names(trainers)
+        self.assertTrue(is_excluded_partner_name("Prof. Dr. Test Lecturer"))
+        self.assertTrue(is_excluded_partner_name("Test Lecturer"))
+        self.assertTrue(is_excluded_partner_name("Assistant First"))
+        self.assertFalse(is_excluded_partner_name("Student Max"))
 
     def test_submit_grades_and_upload_feedback_mock(self) -> None:
         session = MagicMock()

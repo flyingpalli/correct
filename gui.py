@@ -33,6 +33,7 @@ from pdf_processor import (
     expand_marked_items_with_partners,
     forget_confirmed_partner,
     format_student_pdf_name,
+    get_excluded_partner_names,
     load_manifest,
     load_manifest_with_roster,
     load_user_settings,
@@ -828,7 +829,7 @@ INDEX_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   <script>
     const CSRF_TOKEN = "__CSRF_TOKEN__";
-    let currentState = { sheet: 1, students: [], course_roster: [], show_pdf_preview: true };
+    let currentState = { sheet: 1, students: [], course_roster: [], excluded_trainers: [], show_pdf_preview: true };
     let pdfPreviewEnabled = true;
     let previewRunId = 0;          // Cancellation token to immediately halt background PDF rendering
     const headerPreviewCache = {}; // key: `${sheet}:${filename}` -> dataURL
@@ -1010,10 +1011,17 @@ INDEX_HTML_TEMPLATE = r"""<!DOCTYPE html>
         fullTypedStr.length > 0;
 
       const lowerTyped = fullTypedStr.toLowerCase();
-      const isAssignmentTextLayer =
-        (lowerTyped.includes("peter") && (lowerTyped.includes("müller") || lowerTyped.includes("mueller") || lowerTyped.includes("muller"))) ||
-        (lowerTyped.includes("tamas") || lowerTyped.includes("tamás")) && lowerTyped.includes("makai") ||
-        (lowerTyped.includes("margherita") && lowerTyped.includes("ferrero"));
+      let isAssignmentTextLayer = false;
+      const excludedTrainers = Array.isArray(currentState.excluded_trainers)
+        ? currentState.excluded_trainers
+        : [];
+      for (const trainer of excludedTrainers) {
+        const parts = trainer.toLowerCase().split(/\s+/).filter((p) => p.length >= 3);
+        if (parts.length >= 2 && parts.every((p) => lowerTyped.includes(p))) {
+          isAssignmentTextLayer = true;
+          break;
+        }
+      }
 
       return { isTotallyTyped, isAssignmentTextLayer, textItems };
     }
@@ -1765,6 +1773,7 @@ class GradingAppState:
                 "show_pdf_preview": bool(settings.get("show_pdf_preview", True)),
                 "students": students_out,
                 "course_roster": roster_out,
+                "excluded_trainers": sorted(get_excluded_partner_names()),
             }
 
 

@@ -1,0 +1,28 @@
+# --- Student data: NEVER commit ---
+# Real sheets, submissions, annotated PDFs, manifests, grades, and roster caches
+/sheets/
+**/sheet_*/
+course_roster_*.json
+manifest_sheet_*.json
+grades_sheet_*.csv
+*.pdf
+
+# Personal settings (username, Bewerter name, confirmed partner pairs)
+settings.json
+
+# --- Fictional dummy data is allowed ---
+!/examples/
+!/examples/**
+!settings.example.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# --- OS and editor files ---
+.DS_Store
+.idea/
+.vscode/

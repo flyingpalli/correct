@@ -258,7 +258,7 @@ Each pair writes both names at the top of page 1, typed or by hand, next to thei
 Some filters keep obvious wrong answers out:
 
 - Pages that are fully typed, such as a copy of the assignment sheet, are skipped.
-- The lecturer and the assistants (**Peter Müller**, **Tamás Makai**, **Margherita Ferrero**) are never suggested.
+- Course lecturers and assistants (participants with the trainer role in Moodle) are automatically recognized and never suggested as partners.
 
 You can always overwrite a suggestion. The partner field autocompletes from the course roster. A scrollable preview of the PDF header sits next to it. Turn the preview off with the toggle to save battery. Rendering stops fully when it is off.
 
