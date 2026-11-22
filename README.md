@@ -13,20 +13,20 @@ The workflow operates on iPad within [a-Shell](https://holzschu.github.io/a-Shel
 - [Overview](#overview)
 - [How It Works](#how-it-works)
 - [Requirements](#requirements)
-- [📱 Installation on iPad](#-installation-on-ipad)
+- [Installation on iPad](#installation-on-ipad)
   - [1. Install a-Shell and dependencies](#1-install-a-shell-and-dependencies)
   - [2. Place scripts in iCloud Drive](#2-place-scripts-in-icloud-drive)
   - [3. Launch the application](#3-launch-the-application)
   - [4. Create a Home Screen shortcut](#4-create-a-home-screen-shortcut)
 - [Installation on a Computer](#installation-on-a-computer)
-- [🔎 Finding Moodle Settings](#-finding-moodle-settings)
-- [✍️ Weekly Workflow](#️-weekly-workflow)
+- [Finding Moodle Settings](#finding-moodle-settings)
+- [Weekly Workflow](#weekly-workflow)
   - [Marking with Notability](#marking-with-notability)
   - [Marking with Goodnotes](#marking-with-goodnotes)
 - [Features in Detail](#features-in-detail)
 - [Command Line Interface](#command-line-interface)
 - [Folder Layout](#folder-layout)
-- [🔒 Privacy and Security](#-privacy-and-security)
+- [Privacy and Security](#privacy-and-security)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
 - [License](#license)
@@ -72,7 +72,7 @@ The application runs a local web service on `127.0.0.1:8765`. On iPad, the inter
 
 ---
 
-## 📱 Installation on iPad
+## Installation on iPad
 
 ### 1. Install a-Shell and dependencies
 
@@ -151,7 +151,7 @@ The system browser opens `http://127.0.0.1:8765/`. To specify a different port, 
 
 ---
 
-## 🔎 Finding Moodle Settings
+## Finding Moodle Settings
 
 Settings persist across sessions in `settings.json`.
 
@@ -193,7 +193,7 @@ The storage path determines where submissions, annotated files, and grade sheets
 
 ---
 
-## ✍️ Weekly Workflow
+## Weekly Workflow
 
 The graphical interface organizes work into three sequential cards:
 
@@ -340,7 +340,7 @@ LMU_Grading/
 
 ---
 
-## 🔒 Privacy and Security
+## Privacy and Security
 
 - **Credential protection:** Passwords reside in memory during active authentication and never touch disk storage.
 - **Local binding:** The local web server binds strictly to loopback interface `127.0.0.1`.
