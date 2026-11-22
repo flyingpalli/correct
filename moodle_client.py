@@ -11,7 +11,7 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -487,6 +487,7 @@ class LMUMoodleClient:
         grading_url = (
             f"{self.base_url}/mod/assign/view.php"
             f"?id={cmid}&action=grading&tifirst=&tilast=&perpage=100"
+            f"&status=&workflowfilter=&markingallocationfilter="
         )
         assert_https_and_host(grading_url, {"moodle.lmu.de"})
         self._report_progress("Fetching Moodle grading table (page 1)...")
@@ -655,12 +656,13 @@ class LMUMoodleClient:
                 grading_url = (
                     f"{self.base_url}/mod/assign/view.php"
                     f"?id={cmid}&action=grading&tifirst=&tilast=&perpage=100"
+                    f"&status=&workflowfilter=&markingallocationfilter="
                 )
                 assert_https_and_host(grading_url, {"moodle.lmu.de"})
                 resp = self.session.get(grading_url, verify=self.verify_tls, timeout=20)
                 if resp.ok:
                     page_html = self._clear_sticky_grading_filters_if_needed(
-                        grading_url, resp.text
+                        grading_url, resp.text, ensure_quickgrade=False
                     )
                     rows = self.parse_grading_table_html(page_html)
                     for r in rows:
@@ -941,7 +943,7 @@ class LMUMoodleClient:
                 for fname, url in pdf_links:
                     full_url = urljoin(self.base_url, url)
                     assert_https_and_host(full_url, {"moodle.lmu.de"})
-                    r = self.session.get(full_url, verify=self.verify_tls, timeout=60)
+                    r = self.session.get(full_url, verify=self.verify_tls, timeout=(30, 120))
                     r.raise_for_status()
                     student_payloads.append((fname, r.content))
                 files_by_userid[row.userid] = student_payloads
@@ -1038,7 +1040,7 @@ class LMUMoodleClient:
                 "overwrite": "1",
             }
             resp = self.session.post(
-                upload_url, data=data, files=files, verify=self.verify_tls, timeout=60
+                upload_url, data=data, files=files, verify=self.verify_tls, timeout=(30, 180)
             )
             resp.raise_for_status()
             result = resp.json()
@@ -1377,17 +1379,80 @@ class LMUMoodleClient:
             print(f"[Client] Notice: Course participants lookup skipped: {exc}", flush=True)
             return []
 
+    @staticmethod
+    def _find_quick_grading_form(
+        soup: BeautifulSoup, target_uid: Optional[str] = None
+    ) -> Optional[Any]:
+        """Locate Moodle's Quick Grading table form across Moodle 4.1-4.4 and 4.5+."""
+        forms = soup.find_all("form")
+        if target_uid:
+            for f_tag in forms:
+                if f_tag.find(
+                    ["input", "select"],
+                    {"name": f"quickgrade_{target_uid}"},
+                ) or f_tag.find(
+                    ["input", "select"],
+                    {"name": f"quickgrade_{target_uid}_allocatedmarker"},
+                ):
+                    return f_tag
+
+        for f_tag in forms:
+            if (
+                f_tag.find(["input", "select"], {"name": re.compile(r"^quickgrade_\d+$")})
+                or f_tag.find("input", {"name": "savequickgrades"})
+                or f_tag.find("input", {"name": "_qf__mod_assign_quick_grading_form"})
+                or f_tag.find("input", {"name": "action", "value": "quickgrade"})
+                or f_tag.find(attrs={"data-region": "quick-grading-save"})
+            ):
+                return f_tag
+        return None
+
     def _clear_sticky_grading_filters_if_needed(
         self, grading_url: str, html: str, ensure_quickgrade: bool = True
     ) -> str:
-        """If Moodle's grading options form has a sticky filter, markerfilter, or disabled quickgrading, reset it."""
+        """If Moodle's grading options have sticky filters or disabled quickgrading, reset them.
+
+        Supports both Moodle 4.1-4.4 (mod_assign_grading_options_form with action=saveoptions)
+        and Moodle 4.5+ (GET query parameters quickgrading, status, workflowfilter,
+        markingallocationfilter, perpage).
+        """
         soup = BeautifulSoup(html, "html.parser")
         has_quickgrade_inputs = bool(
-            soup.find("input", {"name": re.compile(r"^quickgrade_\d+$")})
+            soup.find(["input", "select"], {"name": re.compile(r"^quickgrade_\d+$")})
         )
+        has_quickgrade_form = self._find_quick_grading_form(soup) is not None
         options_form = None
         needs_reset = False
+        m45_needs_reset = False
+
         for f_tag in soup.find_all("form"):
+            # Skip the quick grading form itself (Moodle 4.5 renders perpage inside its sticky footer)
+            action_inp = f_tag.find("input", {"name": "action"})
+            form_action_val = (action_inp.get("value") or "").strip().lower() if action_inp else ""
+            if (
+                form_action_val == "quickgrade"
+                or f_tag.find("input", {"name": "_qf__mod_assign_quick_grading_form"}) is not None
+                or f_tag.find("input", {"name": "savequickgrades"}) is not None
+            ):
+                continue
+
+            # Moodle 4.5+ extra_filters_dropdown_body is a GET form with action="grading"
+            form_method = (f_tag.get("method") or "get").strip().lower()
+            is_m45_extra_filters = (
+                form_method == "get"
+                and form_action_val == "grading"
+                and f_tag.find("input", {"name": "_qf__mod_assign_grading_options_form"}) is None
+            )
+            if is_m45_extra_filters:
+                for sel_name in ("workflowfilter", "markingallocationfilter"):
+                    sel = f_tag.find("select", {"name": sel_name})
+                    if sel is not None:
+                        opt = sel.find("option", selected=True)
+                        val = (opt.get("value") or "").strip() if opt else ""
+                        if val and val != "none":
+                            m45_needs_reset = True
+                continue
+
             has_opt_control = False
             for sel_name in ("filter", "markerfilter", "workflowfilter"):
                 sel = f_tag.find("select", {"name": sel_name})
@@ -1451,6 +1516,64 @@ class LMUMoodleClient:
                     if resp_again.ok:
                         return resp_again.text
                 return resp_reset.text
+
+        # Moodle 4.5+ uses GET parameters on action=grading instead of mod_assign_grading_options_form
+        if not options_form:
+            m45_qg_chk = soup.find(
+                "input", {"id": re.compile(r"^quickgrading-"), "type": "checkbox"}
+            )
+            if ensure_quickgrade and not has_quickgrade_form:
+                if m45_qg_chk is not None or soup.find(
+                    "table", class_=re.compile(r"gradingtable|generaltable|flexible")
+                ) is not None:
+                    m45_needs_reset = True
+
+            # Check Moodle 4.5+ status select_menu hidden input (non-empty status = active filter)
+            status_inp = soup.find("input", {"name": "status"})
+            if status_inp is not None:
+                status_val = (status_inp.get("value") or "").strip()
+                if status_val and "status=" in status_val:
+                    st_q = parse_qs(urlparse(status_val).query)
+                    if any(v for v in st_q.get("status", [])):
+                        m45_needs_reset = True
+                elif status_val:
+                    m45_needs_reset = True
+
+            # Check Moodle 4.5+ sticky footer perpage select
+            perpage_sel = soup.find("select", {"name": "perpage"})
+            if perpage_sel is not None:
+                opt_pp = perpage_sel.find("option", selected=True)
+                val_pp = (opt_pp.get("value") or "").strip() if opt_pp else ""
+                if val_pp in ("10", "20", "50"):
+                    m45_needs_reset = True
+
+            if m45_needs_reset:
+                parsed_u = urlparse(grading_url)
+                q_params = parse_qs(parsed_u.query, keep_blank_values=True)
+                changed = False
+                desired: Dict[str, str] = {
+                    "status": "",
+                    "workflowfilter": "",
+                    "markingallocationfilter": "",
+                    "perpage": "100",
+                }
+                if ensure_quickgrade:
+                    desired["quickgrading"] = "1"
+                for k, v in desired.items():
+                    if q_params.get(k) != [v]:
+                        q_params[k] = [v]
+                        changed = True
+                if changed:
+                    reset_url = urlunparse(
+                        parsed_u._replace(query=urlencode(q_params, doseq=True))
+                    )
+                    assert_https_and_host(reset_url, {"moodle.lmu.de"})
+                    resp_m45 = self.session.get(
+                        reset_url, verify=self.verify_tls, timeout=30
+                    )
+                    if resp_m45.ok:
+                        return resp_m45.text
+
         return html
 
     def fetch_full_course_roster(
@@ -1526,12 +1649,13 @@ class LMUMoodleClient:
                 unfiltered_url = (
                     f"{self.base_url}/mod/assign/view.php"
                     f"?id={cmid}&action=grading&tifirst=&tilast=&perpage=100"
+                    f"&status=&workflowfilter=&markingallocationfilter="
                 )
                 assert_https_and_host(unfiltered_url, {"moodle.lmu.de"})
                 resp_u = self.session.get(unfiltered_url, verify=self.verify_tls, timeout=30)
                 if resp_u.ok:
                     page_html = self._clear_sticky_grading_filters_if_needed(
-                        unfiltered_url, resp_u.text
+                        unfiltered_url, resp_u.text, ensure_quickgrade=False
                     )
                     for r in self.parse_grading_table_html(page_html):
                         _add_or_merge(r)
@@ -1626,13 +1750,16 @@ class LMUMoodleClient:
             lookup_url = (
                 f"{self.base_url}/mod/assign/view.php"
                 f"?id={cmid}&action=grading&tifirst={q_fi}&tilast={q_li}&perpage=100"
+                f"&status=&workflowfilter=&markingallocationfilter="
             )
             assert_https_and_host(lookup_url, {"moodle.lmu.de"})
             try:
                 resp = self.session.get(lookup_url, verify=self.verify_tls, timeout=20)
                 if not resp.ok:
                     continue
-                page_html = self._clear_sticky_grading_filters_if_needed(lookup_url, resp.text)
+                page_html = self._clear_sticky_grading_filters_if_needed(
+                    lookup_url, resp.text, ensure_quickgrade=False
+                )
                 rows = self.parse_grading_table_html(page_html)
                 # Cache any numeric rows we discover
                 existing_ids = {str(x.userid) for x in self.last_all_rows if str(x.userid).isdigit()}
@@ -1815,7 +1942,7 @@ class LMUMoodleClient:
 
         post_url = urljoin(resp.url, form.get("action", batch_url))
         assert_https_and_host(post_url, {"moodle.lmu.de"})
-        post_resp = self.session.post(post_url, data=form_data, verify=self.verify_tls, timeout=60)
+        post_resp = self.session.post(post_url, data=form_data, verify=self.verify_tls, timeout=(30, 180))
         post_resp.raise_for_status()
 
         return (len(uploaded_items), remaining_items)
@@ -1912,7 +2039,7 @@ class LMUMoodleClient:
                 post_url = urljoin(resp.url, form.get("action", batch_url))
                 assert_https_and_host(post_url, {"moodle.lmu.de"})
                 post_resp = self.session.post(
-                    post_url, data=form_data, verify=self.verify_tls, timeout=60
+                    post_url, data=form_data, verify=self.verify_tls, timeout=(30, 120)
                 )
                 post_resp.raise_for_status()
                 return True
@@ -1978,7 +2105,7 @@ class LMUMoodleClient:
                     post_url = urljoin(resp_g.url, form_g.get("action", grade_url))
                     assert_https_and_host(post_url, {"moodle.lmu.de"})
                     post_resp = self.session.post(
-                        post_url, data=form_data, verify=self.verify_tls, timeout=60
+                        post_url, data=form_data, verify=self.verify_tls, timeout=(30, 120)
                     )
                     post_resp.raise_for_status()
                     return True
@@ -2072,7 +2199,7 @@ class LMUMoodleClient:
         action1 = urljoin(resp.url, form.get("action", f"{self.base_url}/mod/assign/view.php"))
         assert_https_and_host(action1, {"moodle.lmu.de"})
 
-        resp2 = self.session.post(action1, data=step1_data, verify=self.verify_tls, timeout=60)
+        resp2 = self.session.post(action1, data=step1_data, verify=self.verify_tls, timeout=(30, 180))
         resp2.raise_for_status()
 
         # Step 2: Confirm the ZIP import form if Moodle presents a confirmation screen
@@ -2092,7 +2219,7 @@ class LMUMoodleClient:
             action2 = urljoin(resp2.url, confirm_form.get("action", action1))
             assert_https_and_host(action2, {"moodle.lmu.de"})
             resp3 = self.session.post(
-                action2, data=confirm_data, verify=self.verify_tls, timeout=60
+                action2, data=confirm_data, verify=self.verify_tls, timeout=(30, 180)
             )
             resp3.raise_for_status()
 
@@ -2228,6 +2355,7 @@ class LMUMoodleClient:
         qg_url = (
             f"{self.base_url}/mod/assign/view.php"
             f"?id={cmid}&action=grading&tifirst={fi}&tilast={li}&perpage=100"
+            f"&quickgrading=1&status=&workflowfilter=&markingallocationfilter="
         )
         assert_https_and_host(qg_url, {"moodle.lmu.de"})
         resp_qg = self.session.get(qg_url, verify=self.verify_tls, timeout=30)
@@ -2240,13 +2368,7 @@ class LMUMoodleClient:
         marker_id = self._resolve_logged_in_marker_id(soup_qg)
 
         def _locate_qg_form_and_row(s_qg: BeautifulSoup) -> Tuple[Optional[Any], Dict[str, str], bool]:
-            q_form = None
-            for f_tag in s_qg.find_all("form"):
-                if f_tag.find("input", {"name": f"quickgrade_{uid}"}) or f_tag.find(
-                    "input", {"name": "savequickgrades"}
-                ):
-                    q_form = f_tag
-                    break
+            q_form = self._find_quick_grading_form(s_qg, target_uid=uid)
             if not q_form:
                 return (None, {}, False)
             q_payload = self._extract_form_inputs(q_form)
@@ -2274,6 +2396,7 @@ class LMUMoodleClient:
             unfiltered_url = (
                 f"{self.base_url}/mod/assign/view.php"
                 f"?id={cmid}&action=grading&tifirst=&tilast=&perpage=100"
+                f"&quickgrading=1&status=&workflowfilter=&markingallocationfilter="
             )
             assert_https_and_host(unfiltered_url, {"moodle.lmu.de"})
             resp_unf = self.session.get(unfiltered_url, verify=self.verify_tls, timeout=30)
@@ -2286,6 +2409,21 @@ class LMUMoodleClient:
 
         if not qg_form or not has_qg_row:
             return graded_via_single_form
+
+        # Remove other students' fields from payload to avoid optimistic lock conflicts
+        for key in list(payload.keys()):
+            m_uid = re.search(r"(?:^|_)(\d+)(?:_|$)", key)
+            if m_uid and any(
+                p in key
+                for p in (
+                    "quickgrade_",
+                    "grademodified_",
+                    "gradeattempt_",
+                    "allocatedmarker_",
+                )
+            ):
+                if m_uid.group(1) != uid:
+                    payload.pop(key, None)
 
         qg_field = f"quickgrade_{uid}"
         for key, val in list(payload.items()):
@@ -2317,7 +2455,7 @@ class LMUMoodleClient:
         )
         if not payload.get("action"):
             payload["action"] = "quickgrade"
-        post_url = urljoin(qg_url, qg_form.get("action", qg_url))
+        post_url = urljoin(qg_url, qg_form.get("action") or qg_url)
         assert_https_and_host(post_url, {"moodle.lmu.de"})
         post_resp = self.session.post(post_url, data=payload, verify=self.verify_tls, timeout=60)
         post_resp.raise_for_status()
@@ -2368,6 +2506,7 @@ class LMUMoodleClient:
         grading_url = (
             f"{self.base_url}/mod/assign/view.php"
             f"?id={cmid}&action=grading&tifirst=&tilast=&perpage=100"
+            f"&quickgrading=1&status=&workflowfilter=&markingallocationfilter="
         )
         assert_https_and_host(grading_url, {"moodle.lmu.de"})
         resp = self.session.get(grading_url, verify=self.verify_tls, timeout=30)
@@ -2384,18 +2523,24 @@ class LMUMoodleClient:
         if not self.userid or not self.fullname:
             self._extract_user_context(page_html)
 
-        grading_form = None
-        for f_tag in soup.find_all("form"):
-            if f_tag.find("input", {"name": re.compile(r"^quickgrade_\d+$")}) or f_tag.find(
-                "input", {"name": "savequickgrades"}
-            ):
-                grading_form = f_tag
-                break
+        grading_form = self._find_quick_grading_form(soup)
 
         if not grading_form:
-            raise MoodleScrapingError(
-                "Could not find the Quick Grading table form on Moodle."
+            print(
+                "[Client] Notice: Could not find the Quick Grading table form on Moodle. "
+                "Falling back to per-student grading.",
+                flush=True,
             )
+            fallback_count = 0
+            for item in items_with_points:
+                if self.submit_single_student_grade(cmid, item):
+                    fallback_count += 1
+            if fallback_count == 0:
+                raise MoodleScrapingError(
+                    "Could not find the Quick Grading table form on Moodle, "
+                    "and per-student grading fallback failed."
+                )
+            return fallback_count
 
         marker_id = self._resolve_logged_in_marker_id(soup)
         payload = self._extract_form_inputs(grading_form)
@@ -2406,7 +2551,7 @@ class LMUMoodleClient:
         # Remove other students' fields from payload to avoid lock conflicts
         target_uids = {str(it.record.userid) for it in items_with_points}
         for key in list(payload.keys()):
-            m_uid = re.search(r"\b(\d+)\b", key)
+            m_uid = re.search(r"(?:^|_)(\d+)(?:_|$)", key)
             if m_uid and any(
                 p in key
                 for p in (
@@ -2468,13 +2613,20 @@ class LMUMoodleClient:
             if "action" not in payload or not payload["action"]:
                 payload["action"] = "quickgrade"
 
-            post_url = urljoin(resp.url, grading_form.get("action", grading_url))
+            post_url = urljoin(resp.url, grading_form.get("action") or grading_url)
             assert_https_and_host(post_url, {"moodle.lmu.de"})
             try:
-                post_resp = self.session.post(post_url, data=payload, verify=self.verify_tls, timeout=60)
+                post_resp = self.session.post(post_url, data=payload, verify=self.verify_tls, timeout=(30, 120))
                 post_resp.raise_for_status()
-                resp_lower = post_resp.text.lower()
-                if "errorrecordmodified" in resp_lower or ("geändert" in resp_lower and "fehler" in resp_lower):
+                resp_lower = str(getattr(post_resp, "text", "") or "").lower()
+                if (
+                    "errorrecordmodified" in resp_lower
+                    or ("geändert" in resp_lower and "fehler" in resp_lower)
+                    or "verändert hat, als sie die seite geladen haben" in resp_lower
+                    or "modified one or more records more recently" in resp_lower
+                    or "nousersselected" in resp_lower
+                    or "errorquickgradingvsadvancedgrading" in resp_lower
+                ):
                     quickgrade_failed = True
             except Exception as qg_exc:
                 print(

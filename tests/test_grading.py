@@ -15,6 +15,7 @@ from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 from moodle_client import (
     ALLOWED_AUTH_HOSTS,
     LMUMoodleClient,
+    MoodleScrapingError,
     RawSubmissionRow,
     SecurityError,
     assert_https_and_host,
@@ -1995,6 +1996,468 @@ class TestGUIAndSettings(unittest.TestCase):
                     self.assertNotIn("102", uploaded_uids)
                     self.assertIn("101", graded_uids)
                     self.assertNotIn("102", graded_uids)
+        finally:
+            if orig_settings is not None:
+                SETTINGS_FILE.write_bytes(orig_settings)
+            elif SETTINGS_FILE.exists():
+                SETTINGS_FILE.unlink()
+
+    def test_moodle45_quickgrade_without_savequickgrades_strips_other_students_and_handles_solo_student(
+        self,
+    ) -> None:
+        """Verify Moodle 4.5+ quick grading (GET quickgrading=1, sticky footer button, no savequickgrades) and solo students."""
+        session = MagicMock()
+        client = LMUMoodleClient(session=session)
+        client.sesskey = "sess_xyz"
+        client.userid = "9876"
+        client.fullname = "Paskal Tutor"
+
+        # Moodle 4.5 grading page: extra_filters_dropdown_body GET form, quickgrading checkbox outside any form,
+        # mod_assign_quick_grading_form with sticky footer (no savequickgrades input, perpage select inside form)
+        moodle45_page = MagicMock()
+        moodle45_page.ok = True
+        moodle45_page.url = (
+            "https://moodle.lmu.de/mod/assign/view.php"
+            "?id=2672327&action=grading&tifirst=&tilast=&perpage=100"
+            "&quickgrading=1&status=&workflowfilter=&markingallocationfilter="
+        )
+        moodle45_page.text = """
+        <div class="container-fluid tertiary-navigation">
+            <form action="https://moodle.lmu.de/mod/assign/view.php" method="GET">
+                <input type="hidden" name="id" value="2672327" />
+                <input type="hidden" name="action" value="grading" />
+                <select name="workflowfilter">
+                    <option value="" selected="selected">Kein Filter</option>
+                    <option value="notmarked">Nicht bewertet</option>
+                </select>
+                <input type="submit" value="Anwenden" />
+            </form>
+            <input class="form-check-input" type="checkbox" id="quickgrading-66f1a" checked />
+        </div>
+        <form autocomplete="off" action="https://moodle.lmu.de/mod/assign/view.php" method="post" class="mform">
+            <input type="hidden" name="id" value="2672327" />
+            <input type="hidden" name="action" value="quickgrade" />
+            <input type="hidden" name="sesskey" value="sess_xyz" />
+            <input type="hidden" name="_qf__mod_assign_quick_grading_form" value="1" />
+            <table class="flexible generaltable gradingtable">
+                <tbody>
+                    <tr class="user101">
+                        <td><input type="hidden" name="grademodified_101" value="1700000000" />
+                            <input type="hidden" name="gradeattempt_101" value="0" /></td>
+                        <td><input type="text" name="quickgrade_101" value="" /></td>
+                        <td><input type="hidden" name="quickgrade_101_allocatedmarker" value="9876" /></td>
+                    </tr>
+                    <tr class="user102">
+                        <td><input type="hidden" name="grademodified_102" value="1700000000" />
+                            <input type="hidden" name="gradeattempt_102" value="0" /></td>
+                        <td><input type="text" name="quickgrade_102" value="" /></td>
+                        <td><input type="hidden" name="quickgrade_102_allocatedmarker" value="9876" /></td>
+                    </tr>
+                    <tr class="user103">
+                        <td><input type="hidden" name="grademodified_103" value="1700000000" />
+                            <input type="hidden" name="gradeattempt_103" value="0" /></td>
+                        <td><input type="text" name="quickgrade_103" value="" /></td>
+                        <td><input type="hidden" name="quickgrade_103_allocatedmarker" value="9876" /></td>
+                    </tr>
+                    <tr class="user202">
+                        <td><input type="hidden" name="grademodified_202" value="1700000000" />
+                            <input type="hidden" name="gradeattempt_202" value="0" /></td>
+                        <td><input type="text" name="quickgrade_202" value="11,0" /></td>
+                        <td><input type="hidden" name="quickgrade_202_allocatedmarker" value="5555" /></td>
+                    </tr>
+                </tbody>
+            </table>
+            <div class="sticky-footer">
+                <select name="perpage"><option value="100" selected="selected">100</option></select>
+                <div data-region="quick-grading-save">
+                    <input type="hidden" name="sendstudentnotifications" value="0" disabled />
+                    <input type="checkbox" name="sendstudentnotifications" checked="checked" />
+                    <button type="submit" class="btn btn-primary">Speichern</button>
+                </div>
+            </div>
+        </form>
+        """
+
+        post_ok = MagicMock()
+        post_ok.ok = True
+        post_ok.status_code = 200
+        post_ok.url = "https://moodle.lmu.de/mod/assign/view.php"
+        post_ok.text = "<html><body>Bewertungsänderungen wurden gespeichert</body></html>"
+
+        session.get.return_value = moodle45_page
+        session.post.return_value = post_ok
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p1 = Path(tmp) / "MMustermann_sheet1.pdf"
+            p2 = Path(tmp) / "SSolo_sheet1.pdf"
+            p1.write_bytes(make_blank_pdf_bytes(1))
+            p2.write_bytes(make_blank_pdf_bytes(1))
+
+            roster = [
+                CourseStudent(userid="101", fullname="Max Mustermann"),
+                CourseStudent(userid="102", fullname="Erika Musterfrau"),
+                CourseStudent(userid="103", fullname="Sam Solo"),
+            ]
+            # Paired submission + solo submission (no partner)
+            rec_pair = StudentSubmissionRecord(
+                userid="101",
+                fullname="Max Mustermann",
+                firstname="Max",
+                surname="Mustermann",
+                filename="MMustermann_sheet1.pdf",
+                sheet_number=1,
+                partner_userid="102",
+                partner_fullname="Erika Musterfrau",
+                partner_match_source="confirmed",
+            )
+            rec_solo = StudentSubmissionRecord(
+                userid="103",
+                fullname="Sam Solo",
+                firstname="Sam",
+                surname="Solo",
+                filename="SSolo_sheet1.pdf",
+                sheet_number=1,
+            )
+            expanded = expand_marked_items_with_partners(
+                [
+                    MarkedSubmissionItem(record=rec_pair, pdf_path=p1, points="16.5"),
+                    MarkedSubmissionItem(record=rec_solo, pdf_path=p2, points="19.0"),
+                ],
+                roster,
+            )
+            self.assertEqual([it.record.userid for it in expanded], ["101", "103", "102"])
+
+            graded_count = client.submit_grades_to_grading_table(2672327, expanded)
+            self.assertEqual(graded_count, 3)
+
+            # GET URL passed quickgrading=1 and cleared Moodle 4.5 filters
+            get_url = session.get.call_args_list[0].args[0]
+            self.assertIn("quickgrading=1", get_url)
+            self.assertIn("status=", get_url)
+            self.assertIn("workflowfilter=", get_url)
+            self.assertIn("markingallocationfilter=", get_url)
+
+            # Single POST saved all 3 target students and stripped unrelated user 202
+            self.assertEqual(session.post.call_count, 1)
+            post_data = session.post.call_args_list[0].kwargs["data"]
+            self.assertEqual(post_data["action"], "quickgrade")
+            self.assertEqual(post_data["quickgrade_101"], "16,5")
+            self.assertEqual(post_data["quickgrade_102"], "16,5")
+            self.assertEqual(post_data["quickgrade_103"], "19,0")
+            self.assertEqual(post_data["sendstudentnotifications"], "0")
+            self.assertNotIn("quickgrade_202", post_data)
+            self.assertNotIn("grademodified_202", post_data)
+            self.assertNotIn("gradeattempt_202", post_data)
+            self.assertNotIn("quickgrade_202_allocatedmarker", post_data)
+
+    def test_moodle45_clear_sticky_filters_enables_quickgrading_via_get(self) -> None:
+        """Verify _clear_sticky_grading_filters_if_needed enables Moodle 4.5 quickgrading via GET when disabled."""
+        session = MagicMock()
+        client = LMUMoodleClient(session=session)
+        client.sesskey = "sess_xyz"
+
+        disabled_qg_html = """
+        <div class="container-fluid tertiary-navigation">
+            <form action="https://moodle.lmu.de/mod/assign/view.php" method="GET">
+                <input type="hidden" name="id" value="2672327" />
+                <input type="hidden" name="action" value="grading" />
+                <select name="workflowfilter">
+                    <option value="">Kein Filter</option>
+                    <option value="notmarked" selected="selected">Nicht bewertet</option>
+                </select>
+                <input type="submit" value="Anwenden" />
+            </form>
+            <input class="form-check-input" type="checkbox" id="quickgrading-99a" />
+        </div>
+        <table class="flexible generaltable gradingtable"><tbody></tbody></table>
+        """
+        enabled_qg_resp = MagicMock()
+        enabled_qg_resp.ok = True
+        enabled_qg_resp.text = """
+        <form action="https://moodle.lmu.de/mod/assign/view.php" method="post" class="mform">
+            <input type="hidden" name="action" value="quickgrade" />
+            <input type="hidden" name="_qf__mod_assign_quick_grading_form" value="1" />
+            <input type="text" name="quickgrade_101" value="" />
+        </form>
+        """
+        session.get.return_value = enabled_qg_resp
+
+        initial_url = "https://moodle.lmu.de/mod/assign/view.php?id=2672327&action=grading&tifirst=&tilast=&perpage=100"
+        result_html = client._clear_sticky_grading_filters_if_needed(
+            initial_url, disabled_qg_html, ensure_quickgrade=True
+        )
+        self.assertIn("quickgrade_101", result_html)
+        self.assertEqual(session.post.call_count, 0)
+        self.assertEqual(session.get.call_count, 1)
+        called_url = session.get.call_args_list[0].args[0]
+        self.assertIn("quickgrading=1", called_url)
+        self.assertIn("workflowfilter=", called_url)
+        self.assertIn("markingallocationfilter=", called_url)
+        self.assertIn("status=", called_url)
+
+    def test_missing_quickgrade_form_falls_back_to_single_student_grading(self) -> None:
+        """Verify submit_grades_to_grading_table falls back to per-student grading when Quick Grading is unavailable."""
+        session = MagicMock()
+        client = LMUMoodleClient(session=session)
+        client.sesskey = "sess_xyz"
+        client.userid = "9876"
+        client.fullname = "Paskal Tutor"
+
+        no_qg_page = MagicMock()
+        no_qg_page.ok = True
+        no_qg_page.url = (
+            "https://moodle.lmu.de/mod/assign/view.php"
+            "?id=2672327&action=grading&tifirst=&tilast=&perpage=100"
+            "&quickgrading=1&status=&workflowfilter=&markingallocationfilter="
+        )
+        no_qg_page.text = "<html><body><table class='gradingtable'><tbody></tbody></table></body></html>"
+        session.get.return_value = no_qg_page
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "MMustermann_sheet1.pdf"
+            p.write_bytes(make_blank_pdf_bytes(1))
+            rec = StudentSubmissionRecord(
+                userid="101",
+                fullname="Max Mustermann",
+                firstname="Max",
+                surname="Mustermann",
+                filename="MMustermann_sheet1.pdf",
+                sheet_number=1,
+            )
+            item = MarkedSubmissionItem(record=rec, pdf_path=p, points="15.0")
+
+            # 1. Succeeds via single-student fallback
+            client.submit_single_student_grade = MagicMock(return_value=True)
+            count = client.submit_grades_to_grading_table(2672327, [item])
+            self.assertEqual(count, 1)
+            client.submit_single_student_grade.assert_called_once_with(2672327, item)
+
+            # 2. Raises MoodleScrapingError if fallback also grades 0 students
+            client.submit_single_student_grade = MagicMock(return_value=False)
+            with self.assertRaises(MoodleScrapingError):
+                client.submit_grades_to_grading_table(2672327, [item])
+
+    def test_async_upload_job_polling_avoids_300s_timeout(self) -> None:
+        """Verify POST /api/upload with async_job=True returns 202 and completes via /api/progress polling."""
+        import json
+        import threading
+        import time
+        from http.server import ThreadingHTTPServer
+        import requests
+        from gui import GradingAppState, make_handler_class
+        from pdf_processor import SETTINGS_FILE, save_user_settings
+
+        orig_settings = SETTINGS_FILE.read_bytes() if SETTINGS_FILE.exists() else None
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                sheet_dir = root / "sheet_1"
+                marked_dir = sheet_dir / "marked"
+                marked_dir.mkdir(parents=True)
+                (sheet_dir / "to_mark").mkdir(parents=True)
+                (marked_dir / "MMustermann_sheet1.pdf").write_bytes(make_blank_pdf_bytes(1))
+                (sheet_dir / "grades_sheet_1.csv").write_text(
+                    "filename,student_name,userid,partner_name,partner_userid,points\n"
+                    "MMustermann_sheet1.pdf,Max Mustermann,101,,,18.0\n",
+                    encoding="utf-8",
+                )
+                rec = StudentSubmissionRecord(
+                    userid="101",
+                    fullname="Max Mustermann",
+                    firstname="Max",
+                    surname="Mustermann",
+                    filename="MMustermann_sheet1.pdf",
+                    sheet_number=1,
+                    participant_id="55501",
+                    moodle_folder="Max Mustermann_55501_assignsubmission_file_",
+                    current_grade="18.0",
+                )
+                roster = [
+                    RawSubmissionRow(
+                        userid="101",
+                        fullname="Max Mustermann",
+                        allocated_marker="Paskal Tutor",
+                        allocated_marker_id="9876",
+                        current_grade="",
+                    )
+                ]
+                save_manifest(sheet_dir / "manifest_sheet_1.json", 48957, 2672999, 1, [rec], course_roster=roster)
+                save_user_settings({"workdir": str(root), "last_sheet": 1, "course_id": 48957, "marker": "Paskal Tutor"})
+
+                app_state = GradingAppState()
+                app_state.client.sesskey = "test_sesskey"
+                app_state.client.userid = "9876"
+                app_state.client.fullname = "Paskal Tutor"
+                app_state.client.last_all_rows = list(roster)
+                app_state.client.allocate_marker_to_users = MagicMock(return_value=True)
+                app_state.client.upload_bulk_feedback_zip = MagicMock(return_value=True)
+                app_state.client.submit_grades_to_grading_table = MagicMock(return_value=1)
+
+                server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler_class(app_state))
+                port = server.server_address[1]
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    base = f"http://127.0.0.1:{port}"
+                    r_home = requests.get(f"{base}/", timeout=5)
+                    self.assertIn("apiPostLongJob", r_home.text)
+                    self.assertIn("dialog-progress-box", r_home.text)
+
+                    csrf_headers = {
+                        "Content-Type": "application/json",
+                        "X-CSRF-Token": app_state.csrf_token,
+                    }
+                    r_start = requests.post(
+                        f"{base}/api/upload",
+                        headers=csrf_headers,
+                        data=json.dumps({"sheet": 1, "dry_run": False, "async_job": True}),
+                        timeout=5,
+                    )
+                    self.assertEqual(r_start.status_code, 202)
+                    job_id = r_start.json()["job_id"]
+                    self.assertTrue(job_id)
+
+                    poll_data = {}
+                    for _ in range(50):
+                        r_poll = requests.get(f"{base}/api/progress?job_id={job_id}", timeout=5)
+                        self.assertEqual(r_poll.status_code, 200)
+                        poll_data = r_poll.json()
+                        if poll_data.get("status") != "running":
+                            break
+                        time.sleep(0.05)
+
+                    self.assertEqual(poll_data.get("status"), "done")
+                    self.assertTrue(poll_data["result"]["ok"])
+                    self.assertIn("entered 1 grade(s)", poll_data["result"]["message"])
+
+                    # Verify error propagation on background job failure (missing sheet 99)
+                    r_err_start = requests.post(
+                        f"{base}/api/upload",
+                        headers=csrf_headers,
+                        data=json.dumps({"sheet": 99, "dry_run": False, "async_job": True}),
+                        timeout=5,
+                    )
+                    self.assertEqual(r_err_start.status_code, 202)
+                    err_job_id = r_err_start.json()["job_id"]
+                    err_poll = {}
+                    for _ in range(50):
+                        r_poll = requests.get(f"{base}/api/progress?job_id={err_job_id}", timeout=5)
+                        err_poll = r_poll.json()
+                        if err_poll.get("status") != "running":
+                            break
+                        time.sleep(0.05)
+                    self.assertEqual(err_poll.get("status"), "error")
+                    self.assertIn("No manifest found", err_poll.get("error", ""))
+                finally:
+                    server.shutdown()
+                    server.server_close()
+        finally:
+            if orig_settings is not None:
+                SETTINGS_FILE.write_bytes(orig_settings)
+            elif SETTINGS_FILE.exists():
+                SETTINGS_FILE.unlink()
+
+    def test_download_uses_filename_and_previous_partners_only_without_pdf_ocr(self) -> None:
+        """Verify /api/download skips PDF OCR/text extraction and matches only by filename and previous partners."""
+        import json
+        import threading
+        from http.server import ThreadingHTTPServer
+        from unittest.mock import patch
+        import requests
+        from gui import GradingAppState, make_handler_class
+        from pdf_processor import SETTINGS_FILE, save_user_settings
+
+        orig_settings = SETTINGS_FILE.read_bytes() if SETTINGS_FILE.exists() else None
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                save_user_settings(
+                    {
+                        "workdir": str(root),
+                        "last_sheet": 2,
+                        "course_id": 48957,
+                        "marker": "Paskal Tutor",
+                        "known_partners": {"101": "102", "102": "101"},
+                    }
+                )
+
+                app_state = GradingAppState()
+                app_state.client.sesskey = "test_sesskey"
+                app_state.client.userid = "9876"
+                app_state.client.fullname = "Paskal Tutor"
+
+                assigned = [
+                    RawSubmissionRow(userid="101", fullname="Max Mustermann", allocated_marker="Paskal Tutor"),
+                    RawSubmissionRow(userid="103", fullname="John Doe", allocated_marker="Paskal Tutor"),
+                    RawSubmissionRow(userid="105", fullname="Sam Solo", allocated_marker="Paskal Tutor"),
+                ]
+                full_roster = assigned + [
+                    RawSubmissionRow(userid="102", fullname="Erika Musterfrau"),
+                    RawSubmissionRow(userid="104", fullname="Jane Smith"),
+                    RawSubmissionRow(userid="106", fullname="Lukas Lindemann"),
+                ]
+
+                app_state.client.find_assignment_cmid = MagicMock(return_value=2672999)
+                app_state.client.fetch_assigned_submissions = MagicMock(return_value=list(assigned))
+                app_state.client.fetch_full_course_roster = MagicMock(return_value=list(full_roster))
+                # Student 105 has "Lukas Lindemann" inside PDF text, which must NOT be scanned during download
+                app_state.client.download_submission_files_and_folders = MagicMock(
+                    return_value={
+                        "101": [("blatt2.pdf", make_blank_pdf_bytes(1, text="irrelevant"))],
+                        "103": [("Abgabe_Doe_Jane_Smith.pdf", make_blank_pdf_bytes(1, text="irrelevant"))],
+                        "105": [
+                            (
+                                "blatt2.pdf",
+                                make_blank_pdf_bytes(1, text="Sam Solo und Lukas Lindemann"),
+                            )
+                        ],
+                    }
+                )
+
+                server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler_class(app_state))
+                port = server.server_address[1]
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    base = f"http://127.0.0.1:{port}"
+                    csrf_headers = {
+                        "Content-Type": "application/json",
+                        "X-CSRF-Token": app_state.csrf_token,
+                    }
+                    with patch("pdf_processor.extract_text_and_ocr_from_pdf") as mock_ocr:
+                        resp = requests.post(
+                            f"{base}/api/download",
+                            headers=csrf_headers,
+                            data=json.dumps(
+                                {"sheet": 2, "course_id": 48957, "workdir": str(root), "marker": "Paskal Tutor"}
+                            ),
+                            timeout=10,
+                        )
+                        self.assertEqual(resp.status_code, 200)
+                        mock_ocr.assert_not_called()
+
+                    data = resp.json()
+                    self.assertTrue(data["ok"])
+                    self.assertEqual(data["downloaded_count"], 3)
+                    self.assertEqual(data["partners_matched"], 2)
+
+                    state = requests.get(f"{base}/api/state?sheet=2", timeout=5).json()
+                    by_name = {s["fullname"]: s for s in state["students"]}
+                    # Matched via known_partners
+                    self.assertEqual(by_name["Max Mustermann"]["partner_fullname"], "Erika Musterfrau")
+                    # Matched via original filename
+                    self.assertEqual(by_name["John Doe"]["partner_fullname"], "Jane Smith")
+                    # Not matched from PDF text during download
+                    self.assertEqual(by_name["Sam Solo"]["partner_fullname"], "")
+
+                    # Verify frontend download button does not auto-trigger runFullPartnerDetection
+                    home_html = requests.get(f"{base}/", timeout=5).text
+                    dl_start = home_html.index('document.getElementById("download-btn")')
+                    dl_end = home_html.index('document.getElementById("refresh-table-btn")')
+                    self.assertNotIn("runFullPartnerDetection", home_html[dl_start:dl_end])
+                finally:
+                    server.shutdown()
+                    server.server_close()
         finally:
             if orig_settings is not None:
                 SETTINGS_FILE.write_bytes(orig_settings)

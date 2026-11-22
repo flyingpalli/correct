@@ -189,7 +189,7 @@ def cmd_download(args: argparse.Namespace) -> int:
             out_path.write_bytes(merged_bytes)
             downloaded_count += 1
 
-        partner = detect_partner_for_record(rec, out_path, course_roster)
+        partner = detect_partner_for_record(rec, None, course_roster)
         if partner:
             partners_matched += 1
 

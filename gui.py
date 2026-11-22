@@ -14,7 +14,7 @@ import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
 from moodle_client import (
@@ -817,6 +817,7 @@ INDEX_HTML_TEMPLATE = r"""<!DOCTYPE html>
         ✓ Student notifications disabled (<span class="mono">sendstudentnotifications = 0</span>) &amp; kept <strong>unreleased</strong> in Moodle Marking Workflow.
       </div>
       <div id="dialog-summary-box" class="mono" style="max-block-size: 240px; overflow: auto; padding: 0.75rem; border: 1px solid var(--color-border); border-radius: var(--radius-control);"></div>
+      <div id="dialog-progress-box" class="mono hidden" role="status" style="padding: 0.6rem 0.75rem; border-radius: var(--radius-control); background-color: var(--color-surface-subtle); color: var(--color-ok-text);"></div>
       <div class="button-row" style="justify-content: flex-end;">
         <button type="button" id="dialog-cancel-btn">Cancel</button>
         <button type="button" id="dialog-dryrun-btn">Run Dry-Run Check</button>
@@ -877,7 +878,7 @@ INDEX_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     async function apiPost(path, payload, timeoutMs = 300000) {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+      const timeoutId = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
       try {
         const resp = await fetch(path, {
           method: "POST",
@@ -906,7 +907,55 @@ INDEX_HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
         throw err;
       } finally {
-        clearTimeout(timeoutId);
+        if (timeoutId !== null) {
+          clearTimeout(timeoutId);
+        }
+      }
+    }
+
+    async function apiPostLongJob(path, payload, onProgress = null) {
+      const startRes = await apiPost(path, { ...payload, async_job: true }, 30000);
+      if (!startRes || !startRes.job_id) {
+        return startRes;
+      }
+      const jobId = startRes.job_id;
+      let consecutiveErrors = 0;
+      while (true) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        const controller = new AbortController();
+        const pollTimeoutId = setTimeout(() => controller.abort(), 15000);
+        try {
+          const resp = await fetch(
+            `/api/progress?job_id=${encodeURIComponent(jobId)}&_ts=${Date.now()}`,
+            { cache: "no-store", signal: controller.signal }
+          );
+          const data = await resp.json();
+          consecutiveErrors = 0;
+          if (!resp.ok) {
+            throw new Error(data.error || `Job status check failed (${resp.status})`);
+          }
+          if (data.progress && typeof onProgress === "function") {
+            onProgress(data.progress);
+          }
+          if (data.status === "done") {
+            return data.result || { ok: true };
+          }
+          if (data.status === "error") {
+            throw new Error(data.error || `Request to ${path} failed.`);
+          }
+        } catch (err) {
+          if (err && err.name !== "AbortError" && !(err instanceof TypeError)) {
+            throw err;
+          }
+          consecutiveErrors++;
+          if (consecutiveErrors >= 15) {
+            throw new Error(
+              "Connection to the local Python server was interrupted while waiting for Moodle. Check the terminal log."
+            );
+          }
+        } finally {
+          clearTimeout(pollTimeoutId);
+        }
       }
     }
 
@@ -1553,20 +1602,26 @@ INDEX_HTML_TEMPLATE = r"""<!DOCTYPE html>
       const origText = btn.textContent;
       btn.disabled = true;
       btn.textContent = "Downloading...";
-      const pollId = startProgressPolling(btn, "Downloading...");
       try {
         const sheet = Number(document.getElementById("sheet-number").value) || 1;
         const course_id = Number(document.getElementById("course-id").value) || 48957;
         const workdir = document.getElementById("workdir-input").value.trim();
         const marker = document.getElementById("marker-input").value.trim();
-        const res = await apiPost("/api/download", { sheet, course_id, workdir, marker }, 300000);
-        clearInterval(pollId);
+        const res = await apiPostLongJob(
+          "/api/download",
+          { sheet, course_id, workdir, marker },
+          (progressMsg) => {
+            btn.textContent = progressMsg;
+            showBanner(progressMsg, false);
+          }
+        );
         await loadState(sheet);
-        await runFullPartnerDetection(sheet);
+        showBanner(
+          `Downloaded ${res.downloaded_count} PDF(s) for Übungsblatt ${sheet} (${res.partners_matched} partner(s) matched from filenames and previous sheets). Use "Detect Partners (PDF + OCR)" to scan PDFs.`
+        );
       } catch (err) {
         showBanner(err.message, true);
       } finally {
-        clearInterval(pollId);
         btn.disabled = false;
         btn.textContent = origText;
       }
@@ -1650,20 +1705,55 @@ INDEX_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     async function triggerUpload(dryRun) {
       const btn = document.getElementById("dialog-confirm-upload-btn");
+      const dryBtn = document.getElementById("dialog-dryrun-btn");
+      const cancelBtn = document.getElementById("dialog-cancel-btn");
+      const progressBox = document.getElementById("dialog-progress-box");
+      const origBtnText = btn.textContent;
+      const origDryText = dryBtn.textContent;
       btn.disabled = true;
+      dryBtn.disabled = true;
+      cancelBtn.disabled = true;
+      if (dryRun) {
+        dryBtn.textContent = "Running dry-run...";
+      } else {
+        btn.textContent = "Uploading...";
+      }
+      if (progressBox) {
+        progressBox.textContent = dryRun ? "Running dry-run check..." : "Starting upload to Moodle...";
+        progressBox.classList.remove("hidden");
+      }
       try {
         const sheet = Number(document.getElementById("sheet-number").value) || currentState.sheet || 1;
         const points = collectPointsFromInputs();
         const partners = collectPartnersFromInputs();
         await apiPost("/api/save-points", { sheet, points, partners }, 20000);
-        const res = await apiPost("/api/upload", { sheet, dry_run: dryRun, points, partners });
+        const res = await apiPostLongJob(
+          "/api/upload",
+          { sheet, dry_run: dryRun, points, partners },
+          (progressMsg) => {
+            if (progressBox) {
+              progressBox.textContent = progressMsg;
+              progressBox.classList.remove("hidden");
+            }
+            showBanner(progressMsg, false);
+          }
+        );
         dialog.close();
         showBanner(res.message);
         await loadState(sheet);
       } catch (err) {
+        dialog.close();
         showBanner(err.message, true);
       } finally {
         btn.disabled = false;
+        dryBtn.disabled = false;
+        cancelBtn.disabled = false;
+        btn.textContent = origBtnText;
+        dryBtn.textContent = origDryText;
+        if (progressBox) {
+          progressBox.classList.add("hidden");
+          progressBox.textContent = "";
+        }
       }
     }
 
@@ -1687,9 +1777,61 @@ class GradingAppState:
         self.client.progress_callback = self._set_progress
         self.lock = threading.Lock()
         self.file_lock = threading.Lock()
+        self.jobs_lock = threading.Lock()
+        self.jobs: Dict[str, Dict[str, Any]] = {}
 
     def _set_progress(self, msg: str) -> None:
         self.progress_message = msg
+
+    def start_background_job(
+        self,
+        path_label: str,
+        fn: Callable[[], Dict[str, Any]],
+        initial_progress: str = "",
+    ) -> str:
+        """Run a long-running Moodle operation in a daemon thread and track its status by job_id."""
+        job_id = secrets.token_hex(12)
+        if initial_progress:
+            self.progress_message = initial_progress
+        with self.jobs_lock:
+            if len(self.jobs) >= 20:
+                finished = [
+                    jid for jid, info in self.jobs.items() if info.get("status") != "running"
+                ]
+                for old_id in finished[: max(1, len(finished) - 10)]:
+                    self.jobs.pop(old_id, None)
+            self.jobs[job_id] = {
+                "status": "running",
+                "result": None,
+                "error": None,
+            }
+
+        def _worker() -> None:
+            try:
+                with self.lock:
+                    result = fn()
+                with self.jobs_lock:
+                    self.jobs[job_id]["status"] = "done"
+                    self.jobs[job_id]["result"] = result
+            except (PermissionError, SecurityError, MoodleAuthError, MoodleScrapingError, ValueError) as exc:
+                print(f"[GUI] Error on {path_label}: {exc}", flush=True)
+                with self.jobs_lock:
+                    self.jobs[job_id]["status"] = "error"
+                    self.jobs[job_id]["error"] = str(exc)
+            except Exception as exc:
+                print(f"[GUI] Unexpected error on {path_label}: {exc}", flush=True)
+                with self.jobs_lock:
+                    self.jobs[job_id]["status"] = "error"
+                    self.jobs[job_id]["error"] = f"Unexpected error: {exc}"
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        return job_id
+
+    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        with self.jobs_lock:
+            job = self.jobs.get(job_id)
+            return dict(job) if job is not None else None
 
     def build_sheet_state(self, sheet_number: Optional[int] = None) -> Dict[str, Any]:
         with self.file_lock:
@@ -1832,6 +1974,25 @@ def make_handler_class(app_state: GradingAppState):
                     return
 
                 if parsed.path == "/api/progress":
+                    qs = parse_qs(parsed.query)
+                    job_vals = qs.get("job_id")
+                    if job_vals and job_vals[0]:
+                        job = app_state.get_job(job_vals[0])
+                        if job is None:
+                            self._send_json(
+                                {"error": "Unknown background job ID."},
+                                status=HTTPStatus.NOT_FOUND,
+                            )
+                            return
+                        self._send_json(
+                            {
+                                "progress": app_state.progress_message,
+                                "status": job["status"],
+                                "result": job["result"],
+                                "error": job["error"],
+                            }
+                        )
+                        return
                     self._send_json({"progress": app_state.progress_message})
                     return
 
@@ -1986,29 +2147,8 @@ def make_handler_class(app_state: GradingAppState):
                     self._send_json({"ok": True, "state": app_state.build_sheet_state(sheet_num)})
                     return
 
-                with app_state.lock:
-                    if parsed.path == "/api/login":
-                        username = str(body.get("username", "")).strip()
-                        password = str(body.get("password", ""))
-                        body.clear()
-                        if username:
-                            save_user_settings({"username": username})
-                        app_state.client.login(username=username, password=password)
-                        del password
-                        print(
-                            f"[GUI] Signed in as {app_state.client.fullname} (userid={app_state.client.userid})",
-                            flush=True,
-                        )
-                        self._send_json(
-                            {
-                                "ok": True,
-                                "fullname": app_state.client.fullname,
-                                "userid": app_state.client.userid,
-                            }
-                        )
-                        return
-
-                    if parsed.path == "/api/download":
+                if parsed.path == "/api/download":
+                    def _run_download() -> Dict[str, Any]:
                         if not app_state.client.sesskey:
                             raise MoodleAuthError("Please sign in to LMU Moodle first.")
                         app_state.progress_message = "Starting download..."
@@ -2111,10 +2251,10 @@ def make_handler_class(app_state: GradingAppState):
                                 out_pdf_path.write_bytes(merged_bytes)
                                 downloaded_count += 1
 
-                            app_state.progress_message = f"Matching group partner for {row.fullname}..."
+                            app_state.progress_message = f"Checking filename and previous partners for {row.fullname}..."
                             matched_partner = detect_partner_for_record(
                                 rec,
-                                out_pdf_path,
+                                None,
                                 course_roster,
                                 marker_name=marker_str or app_state.client.fullname or "",
                             )
@@ -2138,101 +2278,29 @@ def make_handler_class(app_state: GradingAppState):
                             f"roster={len(course_roster)}, matched {partners_matched} partner(s).",
                             flush=True,
                         )
+                        return {
+                            "ok": True,
+                            "downloaded_count": downloaded_count,
+                            "assigned_count": len(records),
+                            "roster_count": len(course_roster),
+                            "partners_matched": partners_matched,
+                            "to_mark_dir": str(to_mark_dir),
+                        }
+
+                    if body.get("async_job"):
+                        job_id = app_state.start_background_job(
+                            parsed.path, _run_download, initial_progress="Starting download..."
+                        )
                         self._send_json(
-                            {
-                                "ok": True,
-                                "downloaded_count": downloaded_count,
-                                "assigned_count": len(records),
-                                "roster_count": len(course_roster),
-                                "partners_matched": partners_matched,
-                                "to_mark_dir": str(to_mark_dir),
-                            }
+                            {"ok": True, "job_id": job_id}, status=HTTPStatus.ACCEPTED
                         )
                         return
+                    with app_state.lock:
+                        self._send_json(_run_download())
+                    return
 
-                    if parsed.path == "/api/detect-partners":
-                        sheet_num = int(body.get("sheet") or 1)
-                        save_user_settings({"last_sheet": sheet_num})
-                        ocr_texts: Dict[str, str] = body.get("ocr_texts") or {}
-                        settings = load_user_settings()
-                        marker_str = str(settings.get("marker") or app_state.client.fullname or "").strip()
-                        resolved_workdir = resolve_storage_path(str(settings.get("workdir") or "./sheets"))
-                        sheet_dir = resolved_workdir / f"sheet_{sheet_num}"
-                        to_mark_dir = sheet_dir / "to_mark"
-                        marked_dir = sheet_dir / "marked"
-                        manifest_path = sheet_dir / f"manifest_sheet_{sheet_num}.json"
-                        grades_csv_path = sheet_dir / f"grades_sheet_{sheet_num}.csv"
-
-                        if not manifest_path.exists():
-                            raise MoodleScrapingError(
-                                f"No manifest found for sheet {sheet_num}. Download the sheet first."
-                            )
-
-                        course_id, cmid, _, students_by_filename, course_roster = (
-                            load_manifest_with_roster(manifest_path)
-                        )
-
-                        # If the local roster only has the tutor's assigned students and we are signed in, fetch the full Ana 1 roster
-                        if app_state.client.sesskey and len(course_roster) <= len(students_by_filename) + 5:
-                            try:
-                                full_rows = app_state.client.fetch_full_course_roster(
-                                    course_id=course_id, cmid=cmid
-                                )
-                                if full_rows:
-                                    course_roster = []
-                                    for r in full_rows:
-                                        f_n, s_n = split_fullname(r.fullname)
-                                        course_roster.append(
-                                            CourseStudent(
-                                                userid=r.userid,
-                                                fullname=r.fullname,
-                                                firstname=f_n,
-                                                surname=s_n,
-                                                participant_id=r.participant_id,
-                                                moodle_folder=r.moodle_folder,
-                                                matriculation_number=r.matriculation_number,
-                                            )
-                                        )
-                            except Exception as exc:
-                                print(f"[GUI] Notice: Roster refresh during detect-partners skipped: {exc}", flush=True)
-
-                        matched_count = 0
-                        for fname, rec in students_by_filename.items():
-                            pdf_path = to_mark_dir / fname
-                            if not pdf_path.exists() and (marked_dir / fname).exists():
-                                pdf_path = marked_dir / fname
-                            extra_txt = str(ocr_texts.get(fname) or "")
-                            partner = detect_partner_for_record(
-                                rec,
-                                pdf_path if pdf_path.exists() else None,
-                                course_roster,
-                                extra_top_text=extra_txt,
-                                marker_name=marker_str,
-                            )
-                            if partner:
-                                matched_count += 1
-
-                        records_list = list(students_by_filename.values())
-                        with app_state.file_lock:
-                            save_manifest(
-                                manifest_path,
-                                course_id,
-                                cmid,
-                                sheet_num,
-                                records_list,
-                                course_roster=course_roster,
-                            )
-                            sync_grades_csv(grades_csv_path, records_list, overwrite=True)
-                        self._send_json(
-                            {
-                                "ok": True,
-                                "matched_count": matched_count,
-                                "roster_count": len(course_roster),
-                            }
-                        )
-                        return
-
-                    if parsed.path == "/api/upload":
+                if parsed.path == "/api/upload":
+                    def _run_upload() -> Dict[str, Any]:
                         sheet_num = int(body.get("sheet") or 1)
                         save_user_settings({"last_sheet": sheet_num})
                         dry_run = bool(body.get("dry_run", False))
@@ -2342,6 +2410,7 @@ def make_handler_class(app_state: GradingAppState):
                         # Filter out any students whose submissions have already been graded by someone else
                         skipped_items = []
                         if app_state.client.sesskey or app_state.client.last_all_rows:
+                            app_state.progress_message = "Checking Moodle for existing grades by other tutors..."
                             all_graded_items, skipped_items = app_state.client.filter_items_graded_by_others(
                                 cmid, all_graded_items
                             )
@@ -2375,17 +2444,14 @@ def make_handler_class(app_state: GradingAppState):
                                     f"Dry-run passed: all {len(skipped_items)} student(s) were ignored "
                                     f"because their submissions have already been graded by someone else.{skipped_notice}"
                                 )
-                                self._send_json(
-                                    {
-                                        "ok": True,
-                                        "message": msg,
-                                        "skipped_students": [
-                                            {"name": it.record.fullname, "reason": r}
-                                            for it, r in skipped_items
-                                        ],
-                                    }
-                                )
-                                return
+                                return {
+                                    "ok": True,
+                                    "message": msg,
+                                    "skipped_students": [
+                                        {"name": it.record.fullname, "reason": r}
+                                        for it, r in skipped_items
+                                    ],
+                                }
 
                             if all_have_folder:
                                 zbytes = build_moodle_feedback_zip(primary_items)
@@ -2401,17 +2467,14 @@ def make_handler_class(app_state: GradingAppState):
                                     f"and PDF/grades/grader for {len(all_graded_items)} student(s) "
                                     f"({len(primary_items)} submitter(s) + {partner_extra_count} partner(s)). Nothing sent to Moodle.{skipped_notice}"
                                 )
-                            self._send_json(
-                                {
-                                    "ok": True,
-                                    "message": msg,
-                                    "skipped_students": [
-                                        {"name": it.record.fullname, "reason": r}
-                                        for it, r in skipped_items
-                                    ],
-                                }
-                            )
-                            return
+                            return {
+                                "ok": True,
+                                "message": msg,
+                                "skipped_students": [
+                                    {"name": it.record.fullname, "reason": r}
+                                    for it, r in skipped_items
+                                ],
+                            }
 
                         if not app_state.client.sesskey:
                             raise MoodleAuthError("Please sign in to LMU Moodle before uploading.")
@@ -2422,17 +2485,14 @@ def make_handler_class(app_state: GradingAppState):
                                 f"because their submissions have already been graded by someone else: "
                                 f"{', '.join(skipped_names)}."
                             )
-                            self._send_json(
-                                {
-                                    "ok": True,
-                                    "message": msg,
-                                    "skipped_students": [
-                                        {"name": it.record.fullname, "reason": r}
-                                        for it, r in skipped_items
-                                    ],
-                                }
-                            )
-                            return
+                            return {
+                                "ok": True,
+                                "message": msg,
+                                "skipped_students": [
+                                    {"name": it.record.fullname, "reason": r}
+                                    for it, r in skipped_items
+                                ],
+                            }
 
                         # 2. Allocate logged-in tutor as Bewerter (allocatedmarker) for BOTH students first
                         #    so non-submitting partners are included in Moodle's assign::list_participants()
@@ -2467,6 +2527,9 @@ def make_handler_class(app_state: GradingAppState):
                                     if it.record.moodle_folder or it.record.participant_id
                                 ]
                                 zbytes = build_moodle_feedback_zip(zip_items)
+                                app_state.progress_message = (
+                                    f"Uploading bulk feedback ZIP ({len(zip_items)} PDF(s)) to Moodle..."
+                                )
                                 if app_state.client.upload_bulk_feedback_zip(cmid, zbytes):
                                     uploaded_pdfs = len(primary_items)
                             except Exception as zip_exc:
@@ -2478,8 +2541,10 @@ def make_handler_class(app_state: GradingAppState):
                                 cmid, primary_items
                             )
                             uploaded_pdfs += count_batch
-                            for item in remaining:
-                                app_state.progress_message = f"Uploading feedback PDF for {item.record.fullname}..."
+                            for idx, item in enumerate(remaining, start=1):
+                                app_state.progress_message = (
+                                    f"Uploading feedback PDF ({idx}/{len(remaining)}): {item.record.fullname}..."
+                                )
                                 try:
                                     if app_state.client.upload_single_student_feedback_pdf(cmid, item):
                                         uploaded_pdfs += 1
@@ -2496,8 +2561,10 @@ def make_handler_class(app_state: GradingAppState):
                             for it in all_graded_items
                             if it.record.partner_match_source == "partner_expansion"
                         ]
-                        for p_item in partner_items:
-                            app_state.progress_message = f"Uploading feedback PDF for partner {p_item.record.fullname}..."
+                        for idx, p_item in enumerate(partner_items, start=1):
+                            app_state.progress_message = (
+                                f"Uploading feedback PDF for partner ({idx}/{len(partner_items)}): {p_item.record.fullname}..."
+                            )
                             try:
                                 if app_state.client.upload_single_student_feedback_pdf(cmid, p_item):
                                     uploaded_pdfs += 1
@@ -2560,19 +2627,138 @@ def make_handler_class(app_state: GradingAppState):
                                 f" Notice: Ignored {len(skipped_items)} student(s) already graded by someone else: "
                                 f"{', '.join(skipped_names)}."
                             )
+                        return {
+                            "ok": True,
+                            "message": (
+                                f"Uploaded {uploaded_pdfs} annotated PDF(s) and entered {graded_count} grade(s) "
+                                f"(with you as Bewerter) for {len(all_graded_items)} student(s) "
+                                f"({len(primary_items)} submitter(s) + {partner_extra_count} partner(s))."
+                                f"{notice_suffix}"
+                            ),
+                            "skipped_students": [
+                                {"name": it.record.fullname, "reason": r}
+                                for it, r in skipped_items
+                            ],
+                        }
+
+                    if body.get("async_job"):
+                        job_id = app_state.start_background_job(
+                            parsed.path,
+                            _run_upload,
+                            initial_progress=(
+                                "Running dry-run check..."
+                                if body.get("dry_run")
+                                else "Starting upload to Moodle..."
+                            ),
+                        )
+                        self._send_json(
+                            {"ok": True, "job_id": job_id}, status=HTTPStatus.ACCEPTED
+                        )
+                        return
+                    with app_state.lock:
+                        self._send_json(_run_upload())
+                    return
+
+                with app_state.lock:
+                    if parsed.path == "/api/login":
+                        username = str(body.get("username", "")).strip()
+                        password = str(body.get("password", ""))
+                        body.clear()
+                        if username:
+                            save_user_settings({"username": username})
+                        app_state.client.login(username=username, password=password)
+                        del password
+                        print(
+                            f"[GUI] Signed in as {app_state.client.fullname} (userid={app_state.client.userid})",
+                            flush=True,
+                        )
                         self._send_json(
                             {
                                 "ok": True,
-                                "message": (
-                                    f"Uploaded {uploaded_pdfs} annotated PDF(s) and entered {graded_count} grade(s) "
-                                    f"(with you as Bewerter) for {len(all_graded_items)} student(s) "
-                                    f"({len(primary_items)} submitter(s) + {partner_extra_count} partner(s))."
-                                    f"{notice_suffix}"
-                                ),
-                                "skipped_students": [
-                                    {"name": it.record.fullname, "reason": r}
-                                    for it, r in skipped_items
-                                ],
+                                "fullname": app_state.client.fullname,
+                                "userid": app_state.client.userid,
+                            }
+                        )
+                        return
+
+                    if parsed.path == "/api/detect-partners":
+                        sheet_num = int(body.get("sheet") or 1)
+                        save_user_settings({"last_sheet": sheet_num})
+                        ocr_texts: Dict[str, str] = body.get("ocr_texts") or {}
+                        settings = load_user_settings()
+                        marker_str = str(settings.get("marker") or app_state.client.fullname or "").strip()
+                        resolved_workdir = resolve_storage_path(str(settings.get("workdir") or "./sheets"))
+                        sheet_dir = resolved_workdir / f"sheet_{sheet_num}"
+                        to_mark_dir = sheet_dir / "to_mark"
+                        marked_dir = sheet_dir / "marked"
+                        manifest_path = sheet_dir / f"manifest_sheet_{sheet_num}.json"
+                        grades_csv_path = sheet_dir / f"grades_sheet_{sheet_num}.csv"
+
+                        if not manifest_path.exists():
+                            raise MoodleScrapingError(
+                                f"No manifest found for sheet {sheet_num}. Download the sheet first."
+                            )
+
+                        course_id, cmid, _, students_by_filename, course_roster = (
+                            load_manifest_with_roster(manifest_path)
+                        )
+
+                        # If the local roster only has the tutor's assigned students and we are signed in, fetch the full Ana 1 roster
+                        if app_state.client.sesskey and len(course_roster) <= len(students_by_filename) + 5:
+                            try:
+                                full_rows = app_state.client.fetch_full_course_roster(
+                                    course_id=course_id, cmid=cmid
+                                )
+                                if full_rows:
+                                    course_roster = []
+                                    for r in full_rows:
+                                        f_n, s_n = split_fullname(r.fullname)
+                                        course_roster.append(
+                                            CourseStudent(
+                                                userid=r.userid,
+                                                fullname=r.fullname,
+                                                firstname=f_n,
+                                                surname=s_n,
+                                                participant_id=r.participant_id,
+                                                moodle_folder=r.moodle_folder,
+                                                matriculation_number=r.matriculation_number,
+                                            )
+                                        )
+                            except Exception as exc:
+                                print(f"[GUI] Notice: Roster refresh during detect-partners skipped: {exc}", flush=True)
+
+                        matched_count = 0
+                        for fname, rec in students_by_filename.items():
+                            pdf_path = to_mark_dir / fname
+                            if not pdf_path.exists() and (marked_dir / fname).exists():
+                                pdf_path = marked_dir / fname
+                            extra_txt = str(ocr_texts.get(fname) or "")
+                            partner = detect_partner_for_record(
+                                rec,
+                                pdf_path if pdf_path.exists() else None,
+                                course_roster,
+                                extra_top_text=extra_txt,
+                                marker_name=marker_str,
+                            )
+                            if partner:
+                                matched_count += 1
+
+                        records_list = list(students_by_filename.values())
+                        with app_state.file_lock:
+                            save_manifest(
+                                manifest_path,
+                                course_id,
+                                cmid,
+                                sheet_num,
+                                records_list,
+                                course_roster=course_roster,
+                            )
+                            sync_grades_csv(grades_csv_path, records_list, overwrite=True)
+                        self._send_json(
+                            {
+                                "ok": True,
+                                "matched_count": matched_count,
+                                "roster_count": len(course_roster),
                             }
                         )
                         return
